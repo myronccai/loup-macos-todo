@@ -1,0 +1,143 @@
+@mode(host.scripted)
+
+# Tests of the to-do file format (todofile.loup): the exact text written, the
+# round trip, escaping of quotes / backslashes / tabs / newlines / control
+# characters, the escapes the reader accepts, and the errors it reports.
+#
+#   loup test --strict src
+
+from todolist import (TodoList, TodoItem, makeItem);
+from todofile import (formatTodoFile, parseTodoFile, quoteJson, FORMAT_NAME, FORMAT_VERSION);
+from debug.assert import (expect, expectEq, expectThrows);
+
+## The message of the ValueError `parseTodoFile(text)` throws ("" if none).
+func parseError(text: string): string {
+    var message = "";
+    try {
+        parseTodoFile(text);
+    } catch (Exception as e) {
+        message = e.message;
+    }
+    return message;
+}
+
+func sameItems(a: list[TodoItem], b: list[TodoItem]): bool {
+    if (a.len() != b.len()) {
+        return false;
+    }
+    var i = 0;
+    while (i < a.len()) {
+        let x = a[i];
+        let y = b[i];
+        if (x.title != y.title or x.done != y.done or x.priority != y.priority) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+func test_format_writes_the_documented_text(): void {
+    let items: list[TodoItem] = [makeItem("Buy milk", false, "High"), makeItem("Call Ada", true, "Low")];
+    let expected = "{\n"
+        + "  \"format\": \"loup-todo\",\n"
+        + "  \"version\": 1,\n"
+        + "  \"items\": [\n"
+        + "    {\"title\": \"Buy milk\", \"done\": false, \"priority\": \"High\"},\n"
+        + "    {\"title\": \"Call Ada\", \"done\": true, \"priority\": \"Low\"}\n"
+        + "  ]\n"
+        + "}\n";
+    expectEq(formatTodoFile(items), expected, "file text");
+    expectEq(FORMAT_NAME, "loup-todo", "format name");
+    expectEq(FORMAT_VERSION, 1, "format version");
+}
+
+func test_empty_list_round_trips(): void {
+    let empty: list[TodoItem] = [];
+    let text = formatTodoFile(empty);
+    expectEq(text, "{\n  \"format\": \"loup-todo\",\n  \"version\": 1,\n  \"items\": []\n}\n", "empty file");
+    expectEq(parseTodoFile(text).len(), 0, "no items back");
+}
+
+func test_quote_escapes_quotes_backslashes_and_controls(): void {
+    expectEq(quoteJson("plain"), "\"plain\"", "plain");
+    expectEq(quoteJson("say \"hi\""), "\"say \\\"hi\\\"\"", "double quotes");
+    expectEq(quoteJson("it's"), "\"it's\"", "single quotes stay");
+    expectEq(quoteJson("a\\b"), "\"a\\\\b\"", "backslash");
+    expectEq(quoteJson("a\tb"), "\"a\\tb\"", "tab");
+    expectEq(quoteJson("a\nb\r"), "\"a\\nb\\r\"", "newline and return");
+    expectEq(quoteJson("bell\u{7}esc\u{1b}"), "\"bell\\u0007esc\\u001b\"", "other controls as \\u00XX");
+    expectEq(quoteJson("café ✓"), "\"café ✓\"", "non-ASCII stays as it is");
+}
+
+func test_round_trip_keeps_awkward_titles(): void {
+    let todo = TodoList();
+    safe {
+        todo.add("Buy \"good\" milk", "High");
+        todo.add("tab\there", "Normal");
+        todo.add("two\nlines", "Low");
+        todo.add("back\\slash and 'single' quotes", "Normal");
+        todo.add("control \u{1} char, café ✓", "High");
+        todo.add("{\"looks\": [\"like\", json]}", "Low");
+        todo.setDone(1, true);
+        todo.setDone(5, true);
+    }
+    let text = formatTodoFile(todo.items);
+    expect(not text.contains("\t"), "no raw tab in the file");
+    expectEq(text.split("\n").len(), 13, "one line per item: no raw newline inside a title");
+    let back = parseTodoFile(text);
+    expect(sameItems(back, todo.items), "every title, flag and priority comes back");
+    expectEq(back[1].title, "tab\there", "tab title");
+    expectEq(back[2].title, "two\nlines", "newline title");
+    expectEq(back[0].title, "Buy \"good\" milk", "quoted title");
+    expectEq(formatTodoFile(back), text, "writing it again gives the same text");
+}
+
+func test_reader_accepts_any_layout_order_and_escapes(): void {
+    let text = "  {\"items\":[{\"priority\":\"Low\",\"done\":true,\"title\":\"A\\u00e9\\/\\b\\f\"},\r\n"
+        + "\t{ \"title\" : \"\\ud83d\\ude00 smile\" , \"done\" : false , \"priority\" : \"High\" } ],"
+        + "\"version\":1,\"format\":\"loup-todo\"}\n\n";
+    let items = parseTodoFile(text);
+    expectEq(items.len(), 2, "two items");
+    expectEq(items[0].title, "Aé/\u{8}\u{c}", "simple escapes");
+    expect(items[0].done, "done read");
+    expectEq(items[0].priority, "Low", "priority read");
+    expectEq(items[1].title, "\u{1f600} smile", "surrogate pair");
+    expect(not items[1].done, "open read");
+}
+
+func test_reader_reports_where_a_file_is_wrong(): void {
+    expectEq(parseError(""), "not a to-do file: expected '{', found the end of the file at line 1, column 1",
+        "empty text");
+    expectEq(parseError("{\"format\": \"other\", \"version\": 1, \"items\": []}"),
+        "not a to-do file: format is \"other\", not \"loup-todo\" at line 1, column 19", "another format");
+    expectEq(parseError("{\"format\": \"loup-todo\",\n \"version\": 2, \"items\": []}"),
+        "not a to-do file: unsupported version 2 at line 2, column 14", "another version");
+    expectEq(parseError("{\"format\": \"loup-todo\", \"version\": 1}"),
+        "not a to-do file: no \"items\" member at line 1, column 38", "missing items");
+    expectEq(parseError("{\"format\": \"loup-todo\", \"version\": 1, \"items\": [], \"x\": 1}"),
+        "not a to-do file: unknown member \"x\" at line 1, column 56", "unknown member");
+    expectEq(parseError("{\"format\": \"loup-todo\", \"version\": 1, \"items\": []} x"),
+        "not a to-do file: unexpected 'x' after the document at line 1, column 52", "trailing text");
+}
+
+func test_reader_refuses_bad_items(): void {
+    let head = "{\"format\": \"loup-todo\", \"version\": 1, \"items\": [";
+    expect(parseError(head + "{\"title\": \"A\", \"done\": false}]}").contains("an item has no \"priority\""),
+        "missing priority");
+    expect(parseError(head + "{\"title\": \"A\", \"done\": 1, \"priority\": \"Low\"}]}").contains("expected true or false"),
+        "done must be a boolean");
+    expect(parseError(head + "{\"title\": \"A\", \"done\": true, \"priority\": \"Soon\"}]}").contains("unknown priority 'Soon'"),
+        "unknown priority");
+    expect(parseError(head + "{\"title\": \" \", \"done\": true, \"priority\": \"Low\"}]}").contains("needs a title"),
+        "blank title");
+    expect(parseError(head + "{\"title\": \"a\tb\", \"done\": true, \"priority\": \"Low\"}]}").contains("raw control character"),
+        "a raw tab inside a string");
+    expect(parseError(head + "{\"title\": \"a\\qb\", \"done\": true, \"priority\": \"Low\"}]}").contains("unknown escape '\\q'"),
+        "an unknown escape");
+    expect(parseError(head + "{\"title\": \"a\\u12\", \"done\": true, \"priority\": \"Low\"}]}").contains("four hex digits"),
+        "a short \\u escape");
+    expect(parseError(head + "{\"title\": \"open").contains("unterminated string"), "unterminated string");
+    expectEq(parseTodoFile(head + "]}").len(), 0, "an empty list is fine");
+    expectThrows(func(): void { parseTodoFile(head + ",]}"); }, "a stray comma is not");
+}

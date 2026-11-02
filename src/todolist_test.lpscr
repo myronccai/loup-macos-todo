@@ -1,0 +1,187 @@
+@mode(host.scripted)
+
+# Tests of the to-do list model (todolist.loup): adding, ticking off, renaming,
+# deleting, clearing completed items, sorting, filtering and the status line.
+#
+#   loup test --strict src
+
+from todolist import (TodoList, TodoItem, makeItem, itemProblem, priorities, priorityRank,
+    isPriority, DEFAULT_PRIORITY);
+from debug.assert import (expect, expectEq, expectThrows);
+
+## "title/priority/done" of every item, for compact comparisons.
+func describe(todo: TodoList): string {
+    var parts: list[string] = [];
+    for (item in todo.items) {
+        var mark = "-";
+        if (item.done) {
+            mark = "x";
+        }
+        parts.push(item.title + "/" + item.priority + "/" + mark);
+    }
+    let text = parts.join(", ");
+    return text;
+}
+
+func sample(): TodoList {
+    let todo = TodoList();
+    safe {
+        todo.add("Buy milk", "High");
+        todo.add("water plants", "Low");
+        todo.add("Call Ada", "Normal");
+        todo.add("answer mail", "High");
+    }
+    return todo;
+}
+
+func test_priorities_are_ordered_most_urgent_first(): void {
+    let names = priorities();
+    expectEq(names.join(","), "High,Normal,Low", "priority order");
+    expectEq(priorityRank("High"), 0, "High rank");
+    expectEq(priorityRank("Low"), 2, "Low rank");
+    expect(isPriority(DEFAULT_PRIORITY), "the default is a priority");
+    expect(not isPriority("high"), "names are case-sensitive");
+    expectThrows(func(): void { priorityRank("Urgent"); }, "unknown priority rank");
+}
+
+func test_add_trims_and_refuses_blank_titles(): void {
+    let todo = TodoList();
+    var added: list[bool] = [];
+    safe {
+        added.push(todo.add("  Buy milk \t", "High"));
+        added.push(todo.add("   ", "High"));
+        added.push(todo.add("", "Normal"));
+    }
+    expectEq(added.join(","), "true,false,false", "a real title is added, blank and empty ones refused");
+    expectEq(todo.count(), 1, "one item");
+    expectEq(todo.at(0).title, "Buy milk", "title trimmed");
+    expectEq(todo.at(0).priority, "High", "priority kept");
+    expect(not todo.at(0).done, "new items are open");
+    expectThrows(func(): void { safe { todo.add("Something", "Urgent"); } }, "unknown priority");
+    expectEq(todo.count(), 1, "nothing added by the failed add");
+}
+
+func test_item_problems(): void {
+    expectEq(itemProblem("Fine", "Low"), "", "a valid item");
+    expectEq(itemProblem(" ", "Low"), "a to-do item needs a title", "blank title");
+    expectEq(itemProblem("Fine", "Soon"), "unknown priority 'Soon' (High, Normal, Low)", "bad priority");
+    expectThrows(func(): void { makeItem("", false, "Low"); }, "makeItem refuses a blank title");
+}
+
+func test_set_done_and_counts(): void {
+    let todo = sample();
+    expectEq(todo.doneCount(), 0, "nothing done yet");
+    safe {
+        todo.setDone(1, true);
+        todo.setDone(3, true);
+    }
+    expectEq(todo.doneCount(), 2, "two done");
+    safe { todo.setDone(1, false); }
+    expectEq(todo.doneCount(), 1, "unticked again");
+    expect(todo.at(3).done, "item 3 done");
+    expect(not todo.at(1).done, "item 1 open");
+    safe { todo.setDone(3, true); }
+    expectEq(todo.doneCount(), 1, "setDone is idempotent");
+    expectThrows(func(): void { safe { todo.setDone(4, true); } }, "setDone past the end");
+    expectThrows(func(): void { safe { todo.setDone(0 - 1, true); } }, "negative index");
+}
+
+func test_rename_and_remove(): void {
+    let todo = sample();
+    var renamed = false;
+    safe { renamed = todo.rename(2, "  Call Grace "); }
+    expect(renamed, "renamed");
+    expectEq(todo.at(2).title, "Call Grace", "new title trimmed");
+    safe { renamed = todo.rename(2, "  "); }
+    expect(not renamed, "blank rename refused");
+    expectEq(todo.at(2).title, "Call Grace", "title kept");
+    safe { todo.remove(0); }
+    expectEq(describe(todo), "water plants/Low/-, Call Grace/Normal/-, answer mail/High/-", "after remove");
+    expectThrows(func(): void { safe { todo.remove(3); } }, "remove past the end");
+}
+
+func test_clear_completed_keeps_open_items_in_order(): void {
+    let todo = sample();
+    var removed: list[int] = [];
+    safe {
+        todo.setDone(0, true);
+        todo.setDone(2, true);
+        removed.push(todo.clearCompleted());
+    }
+    expectEq(describe(todo), "water plants/Low/-, answer mail/High/-", "open items left");
+    safe { removed.push(todo.clearCompleted()); }
+    expectEq(removed.join(","), "2,0", "two removed, then nothing more to clear");
+}
+
+func test_hide_completed_filter(): void {
+    let todo = sample();
+    safe {
+        todo.setDone(1, true);
+        todo.setDone(2, true);
+    }
+    expectEq(todo.visibleIndexes(false).join(","), "0,1,2,3", "everything shown");
+    expectEq(todo.visibleIndexes(true).join(","), "0,3", "done items hidden");
+    let empty = TodoList();
+    expectEq(empty.visibleIndexes(true).len(), 0, "an empty list shows nothing");
+}
+
+func test_status_line(): void {
+    let todo = TodoList();
+    expectEq(todo.status(false), "0 items, 0 done", "empty");
+    safe { todo.add("One", "Low"); }
+    expectEq(todo.status(false), "1 item, 0 done", "singular");
+    safe {
+        todo.add("Two", "Low");
+        todo.add("Three", "Low");
+        todo.setDone(1, true);
+    }
+    expectEq(todo.status(false), "3 items, 1 done", "plural");
+    expectEq(todo.status(true), "3 items, 1 done (1 hidden)", "with the filter on");
+}
+
+func test_sort_by_title_priority_and_done_is_stable(): void {
+    let todo = sample();
+    var changed: list[bool] = [];
+    safe { changed.push(todo.sortBy("title", true)); }
+    expectEq(describe(todo), "answer mail/High/-, Buy milk/High/-, Call Ada/Normal/-, water plants/Low/-",
+        "by title, ignoring case");
+    safe { changed.push(todo.sortBy("priority", true)); }
+    expectEq(describe(todo), "answer mail/High/-, Buy milk/High/-, Call Ada/Normal/-, water plants/Low/-",
+        "by priority keeps the title order inside a priority");
+    safe {
+        todo.setDone(0, true);
+        changed.push(todo.sortBy("done", true));
+    }
+    expectEq(describe(todo), "Buy milk/High/-, Call Ada/Normal/-, water plants/Low/-, answer mail/High/x",
+        "open items first");
+    expectEq(changed.join(","), "true,false,true", "an already sorted list does not change");
+    expectThrows(func(): void { safe { todo.sortBy("size", true); } }, "unknown sort key");
+}
+
+func test_sort_descending_is_stable_and_reversible(): void {
+    let todo = sample();
+    var changed: list[bool] = [];
+    safe { changed.push(todo.sortBy("priority", false)); }
+    expectEq(describe(todo), "water plants/Low/-, Call Ada/Normal/-, Buy milk/High/-, answer mail/High/-",
+        "Low first; the two High items keep their order");
+    safe { changed.push(todo.sortBy("priority", true)); }
+    expectEq(describe(todo), "Buy milk/High/-, answer mail/High/-, Call Ada/Normal/-, water plants/Low/-",
+        "ascending again: equal items still in the order they had");
+    safe { changed.push(todo.sortBy("title", false)); }
+    expectEq(describe(todo), "water plants/Low/-, Call Ada/Normal/-, Buy milk/High/-, answer mail/High/-",
+        "by title Z to A");
+    safe {
+        todo.setDone(1, true);
+        changed.push(todo.sortBy("done", false));
+    }
+    expectEq(describe(todo), "Call Ada/Normal/x, water plants/Low/-, Buy milk/High/-, answer mail/High/-",
+        "done items first");
+    expectEq(changed.join(","), "true,true,true,true", "every sort reordered");
+}
+
+func test_replace_all(): void {
+    let todo = sample();
+    let items: list[TodoItem] = [makeItem("Only", true, "Low")];
+    safe { todo.replaceAll(items); }
+    expectEq(describe(todo), "Only/Low/x", "replaced");
+}

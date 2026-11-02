@@ -1,0 +1,435 @@
+@mode(host.dual)
+
+# todofile — the to-do file format: a small JSON document, written and read by
+# this module's own serializer and parser (no JSON library).
+#
+#     {
+#       "format": "loup-todo",
+#       "version": 1,
+#       "items": [
+#         {"title": "Buy milk", "done": false, "priority": "High"},
+#         {"title": "Say \"hi\"\tto Ada", "done": true, "priority": "Low"}
+#       ]
+#     }
+#
+# Titles are JSON strings: `"` and `\` are escaped, tab / newline / carriage
+# return as \t \n \r, any other control character as \u00XX. The reader
+# accepts any JSON whitespace and any member order, and every JSON string
+# escape (including \uXXXX surrogate pairs); it refuses unknown members,
+# missing ones, another format name or version, and anything after the
+# closing brace, with a ValueError that names the line and column.
+
+from todolist import (TodoItem, itemProblem);
+
+## The `format` member every to-do file carries.
+pub const FORMAT_NAME: string = "loup-todo";
+## The `version` this module writes and reads.
+pub const FORMAT_VERSION: int = 1;
+
+# ── writing ────────────────────────────────────────────────────────────────
+
+## The hex digit for `value` (0..15).
+func hexDigit(value: int): string {
+    let digits = "0123456789abcdef";
+    let d = digits.substring(value, value + 1);
+    return d;
+}
+
+## `text` as a JSON string literal, quotes included.
+pub func quoteJson(text: string): string {
+    var out: list[string] = ["\""];
+    for (c in text.chars()) {
+        if (c == "\"") {
+            out.push("\\\"");
+        } else if (c == "\\") {
+            out.push("\\\\");
+        } else if (c == "\n") {
+            out.push("\\n");
+        } else if (c == "\r") {
+            out.push("\\r");
+        } else if (c == "\t") {
+            out.push("\\t");
+        } else if (c < " ") {
+            let code = c.scalarAt(0).toInt();
+            out.push("\\u00" + hexDigit(code / 16) + hexDigit(code % 16));
+        } else {
+            out.push(c);
+        }
+    }
+    out.push("\"");
+    let quoted = out.join("");
+    return quoted;
+}
+
+## The file text for `items` (ends with a newline).
+pub func formatTodoFile(items: list[TodoItem]): string {
+    var lines: list[string] = [];
+    lines.push("{");
+    lines.push("  \"format\": " + quoteJson(FORMAT_NAME) + ",");
+    lines.push("  \"version\": " + FORMAT_VERSION.to_string() + ",");
+    if (items.len() == 0) {
+        lines.push("  \"items\": []");
+    } else {
+        lines.push("  \"items\": [");
+        var i = 0;
+        while (i < items.len()) {
+            let item = items[i];
+            var line = "    {\"title\": " + quoteJson(item.title)
+                + ", \"done\": " + item.done.to_string()
+                + ", \"priority\": " + quoteJson(item.priority) + "}";
+            if (i < items.len() - 1) {
+                line = line + ",";
+            }
+            lines.push(line);
+            i = i + 1;
+        }
+        lines.push("  ]");
+    }
+    lines.push("}");
+    let text = lines.join("\n") + "\n";
+    return text;
+}
+
+# ── reading ────────────────────────────────────────────────────────────────
+
+## A cursor over the characters of a document, with the JSON pieces the
+## to-do format needs. The reading methods move the cursor, so they are
+## `modifier`s and the functions that use a Reader take it as `edits` (an
+## `edits` parameter makes a function a safe context for those calls,
+## Compilation §3-2.4.12; `parseTodoFile` makes the first one in `safe { }`).
+class Reader {
+    pub var chars: list[string];
+    pub var pos: int;
+
+    pub func constructor(text: string) {
+        this.chars = text.chars();
+        this.pos = 0;
+    }
+
+    ## The current character, "" at the end.
+    pub func peek(): string {
+        if (this.pos >= this.chars.len()) {
+            return "";
+        }
+        let c = this.chars[this.pos];
+        return c;
+    }
+
+    ## The current character, consumed ("" at the end).
+    pub modifier func next(): string {
+        let c = this.peek();
+        if (c != "") {
+            this.pos = this.pos + 1;
+        }
+        return c;
+    }
+
+    pub modifier func skipSpace(): void {
+        while (true) {
+            let c = this.peek();
+            if (c != " " and c != "\t" and c != "\n" and c != "\r") {
+                return;
+            }
+            this.pos = this.pos + 1;
+        }
+        return;
+    }
+
+    ## A ValueError for `message` at the current position (1-based line and
+    ## column).
+    pub func error(message: string): ValueError {
+        var line = 1;
+        var column = 1;
+        var i = 0;
+        while (i < this.pos and i < this.chars.len()) {
+            if (this.chars[i] == "\n") {
+                line = line + 1;
+                column = 1;
+            } else {
+                column = column + 1;
+            }
+            i = i + 1;
+        }
+        let e = ValueError("not a to-do file: " + message + " at line " + line.to_string()
+            + ", column " + column.to_string());
+        return e;
+    }
+
+    ## A description of the current character for error messages.
+    pub func found(): string {
+        let c = this.peek();
+        if (c == "") {
+            return "the end of the file";
+        }
+        let shown = "'" + c + "'";
+        return shown;
+    }
+
+    ## Skip blanks, then consume `c` (a ValueError when something else is
+    ## there).
+    pub modifier func expect(c: string): void {
+        this.skipSpace();
+        if (this.peek() != c) {
+            throw this.error("expected '" + c + "', found " + this.found());
+        }
+        this.pos = this.pos + 1;
+        return;
+    }
+
+    ## Skip blanks; consume `c` and return true if it is next.
+    pub modifier func accept(c: string): bool {
+        this.skipSpace();
+        if (this.peek() != c) {
+            return false;
+        }
+        this.pos = this.pos + 1;
+        return true;
+    }
+
+    ## A JSON string (after blanks).
+    pub modifier func readString(): string {
+        this.expect("\"");
+        var out: list[string] = [];
+        while (true) {
+            let c = this.next();
+            if (c == "") {
+                throw this.error("unterminated string");
+            }
+            if (c == "\"") {
+                break;
+            }
+            if (c < " ") {
+                this.pos = this.pos - 1;
+                throw this.error("raw control character in a string (it must be escaped)");
+            }
+            if (c != "\\") {
+                out.push(c);
+                continue;
+            }
+            let e = this.next();
+            if (e == "\"" or e == "\\" or e == "/") {
+                out.push(e);
+            } else if (e == "n") {
+                out.push("\n");
+            } else if (e == "t") {
+                out.push("\t");
+            } else if (e == "r") {
+                out.push("\r");
+            } else if (e == "b") {
+                out.push("\u0008");
+            } else if (e == "f") {
+                out.push("\u000c");
+            } else if (e == "u") {
+                out.push(this.readUnicodeEscape());
+            } else {
+                this.pos = this.pos - 1;
+                throw this.error("unknown escape '\\" + e + "'");
+            }
+        }
+        let text = out.join("");
+        return text;
+    }
+
+    ## The character of a \uXXXX escape whose "\u" was just read; a high
+    ## surrogate must be followed by a \uXXXX low surrogate.
+    modifier func readUnicodeEscape(): string {
+        var code = this.readHex4();
+        if (code >= 55296 and code <= 56319) {
+            # U+D800..U+DBFF: the first half of a surrogate pair.
+            if (this.next() != "\\" or this.next() != "u") {
+                throw this.error("a high surrogate escape must be followed by a low one");
+            }
+            let low = this.readHex4();
+            if (low < 56320 or low > 57343) {
+                throw this.error("a high surrogate escape must be followed by a low one");
+            }
+            code = 65536 + (code - 55296) * 1024 + (low - 56320);
+        }
+        let ch = char.of(code);
+        if (ch == None) {
+            throw this.error("\\u escape is not a character");
+        }
+        let text = ch.unwrap().toString();
+        return text;
+    }
+
+    modifier func readHex4(): int {
+        let digits = "0123456789abcdef";
+        var value = 0;
+        var i = 0;
+        while (i < 4) {
+            let c = this.next().toLowerCase();
+            let d = digits.indexOf(c);
+            if (c == "" or d < 0) {
+                throw this.error("\\u needs four hex digits");
+            }
+            value = value * 16 + d;
+            i = i + 1;
+        }
+        return value;
+    }
+
+    ## `true` or `false` (after blanks).
+    pub modifier func readBool(): bool {
+        this.skipSpace();
+        if (this.readWord("true")) {
+            return true;
+        }
+        if (this.readWord("false")) {
+            return false;
+        }
+        throw this.error("expected true or false, found " + this.found());
+    }
+
+    modifier func readWord(word: string): bool {
+        let n = word.len();
+        if (this.pos + n > this.chars.len()) {
+            return false;
+        }
+        let candidate = this.chars.slice(this.pos, this.pos + n).join("");
+        if (candidate != word) {
+            return false;
+        }
+        this.pos = this.pos + n;
+        return true;
+    }
+
+    ## A non-negative integer (after blanks).
+    pub modifier func readInt(): int {
+        this.skipSpace();
+        let digits = "0123456789";
+        var value = 0;
+        var count = 0;
+        while (true) {
+            let d = digits.indexOf(this.peek());
+            if (this.peek() == "" or d < 0) {
+                break;
+            }
+            value = value * 10 + d;
+            count = count + 1;
+            this.pos = this.pos + 1;
+        }
+        if (count == 0) {
+            throw this.error("expected a number, found " + this.found());
+        }
+        return value;
+    }
+}
+
+## One `{"title": …, "done": …, "priority": …}` object.
+func readItem(edits r: Reader): TodoItem {
+    r.expect("{");
+    var title = "";
+    var done = false;
+    var priority = "";
+    var seen: list[string] = [];
+    if (not r.accept("}")) {
+        while (true) {
+            let key = r.readString();
+            if (seen.contains(key)) {
+                throw r.error("duplicate member \"" + key + "\" in an item");
+            }
+            seen.push(key);
+            r.expect(":");
+            if (key == "title") {
+                title = r.readString();
+            } else if (key == "done") {
+                done = r.readBool();
+            } else if (key == "priority") {
+                priority = r.readString();
+            } else {
+                throw r.error("unknown member \"" + key + "\" in an item");
+            }
+            if (r.accept("}")) {
+                break;
+            }
+            r.expect(",");
+        }
+    }
+    for (required in ["title", "done", "priority"]) {
+        if (not seen.contains(required)) {
+            throw r.error("an item has no \"" + required + "\"");
+        }
+    }
+    # Checked here (not by makeItem) so the error names the position.
+    let problem = itemProblem(title, priority);
+    if (problem != "") {
+        throw r.error(problem);
+    }
+    let item = TodoItem(title, done, priority);
+    return item;
+}
+
+## The `[ item, … ]` array.
+func readItems(edits r: Reader): list[TodoItem] {
+    var items: list[TodoItem] = [];
+    r.expect("[");
+    if (r.accept("]")) {
+        return items;
+    }
+    while (true) {
+        items.push(readItem(edits: r));
+        if (r.accept("]")) {
+            break;
+        }
+        r.expect(",");
+    }
+    return items;
+}
+
+## The items of the to-do file `text` (ValueError when it is not one).
+pub func parseTodoFile(text: string): list[TodoItem] {
+    let r = Reader(text);
+    var items: list[TodoItem] = [];
+    safe {
+        items = readDocument(edits: r);
+    }
+    return items;
+}
+
+## The whole document: `{ "format": …, "version": …, "items": [ … ] }` and
+## nothing after it but blanks.
+func readDocument(edits r: Reader): list[TodoItem] {
+    var items: list[TodoItem] = [];
+    var seen: list[string] = [];
+    r.expect("{");
+    if (not r.accept("}")) {
+        while (true) {
+            let key = r.readString();
+            if (seen.contains(key)) {
+                throw r.error("duplicate member \"" + key + "\"");
+            }
+            seen.push(key);
+            r.expect(":");
+            if (key == "format") {
+                let name = r.readString();
+                if (name != FORMAT_NAME) {
+                    throw r.error("format is \"" + name + "\", not \"" + FORMAT_NAME + "\"");
+                }
+            } else if (key == "version") {
+                let version = r.readInt();
+                if (version != FORMAT_VERSION) {
+                    throw r.error("unsupported version " + version.to_string());
+                }
+            } else if (key == "items") {
+                items = readItems(edits: r);
+            } else {
+                throw r.error("unknown member \"" + key + "\"");
+            }
+            if (r.accept("}")) {
+                break;
+            }
+            r.expect(",");
+        }
+    }
+    for (required in ["format", "version", "items"]) {
+        if (not seen.contains(required)) {
+            throw r.error("no \"" + required + "\" member");
+        }
+    }
+    r.skipSpace();
+    if (r.peek() != "") {
+        throw r.error("unexpected " + r.found() + " after the document");
+    }
+    return items;
+}

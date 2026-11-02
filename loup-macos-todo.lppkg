@@ -1,0 +1,15 @@
+name = "loup-macos-todo"
+version = "0.1.0"
+
+[build]
+entry = "src/main.lphc"
+mode = "host.native"
+delivery = "native"
+
+[dependencies]
+appkit = { path = "../loup-macos-appkit" }
+
+# AppKit's classes are found by name at run time, so nothing the program calls
+# pulls the framework in: link it here.
+[delivery.native]
+framework = ["AppKit"]

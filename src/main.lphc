@@ -1,0 +1,780 @@
+@mode(host.native)
+
+# loup-macos-todo — a to-do list manager: a table of items (done check box, title,
+# priority), a field + priority pop-up + Add button for new items, Delete,
+# Clear Completed, a "Hide completed" filter, a status line, and File menu
+# New / Open… / Save / Save As… to a small JSON file (todofile.loup).
+#
+# The model, the filter and the file format are host.dual modules
+# (todolist.loup, todofile.loup) tested by `loup test`; this file is only the
+# window and the glue. The table shows `g_rows`: the model indexes of the
+# visible items, recomputed by `refresh()` after every change.
+#
+# `--self-test [png]` drives the window through its controls (typing, clicks,
+# table cells, the File menu with canned dialog answers), prints what the
+# controls show after each step, optionally snapshots the window, and quits.
+
+from appkit.app import (appInit, run, quit, after, isSelfTest, onShouldQuit, insertMenu, menuBar,
+    menuBarMenu, appMenu, windowMenu, Menu, Window, MOD_COMMAND);
+from appkit.controls import (Label, Button, Checkbox, TextField, PopUpButton, systemColor,
+    COLOR_SECONDARY_LABEL);
+from appkit.layout import (VStack, HStack, ALIGN_FILL, ALIGN_CENTER, setMinSize);
+from appkit.table import (TableView, COLUMN_USER_RESIZES);
+from appkit.dialogs import (alert, openFile, saveFile, beep, setTestAnswers, testLog);
+from io.fs import (createDir);
+from todolist import (TodoList, TodoItem, priorities, priorityRank, DEFAULT_PRIORITY);
+from todofile import (formatTodoFile, parseTodoFile);
+
+const APP_NAME: string = "To-Do";
+## The extension Save proposes; Open also accepts plain .json files.
+const FILE_EXTENSION: string = "todo";
+
+## The answers of the "save changes?" alert (buttons Save, Cancel, Don't
+## Save). Anything else — Cancel (1), or -1 when the alert ends without a
+## button press — keeps the changes and stops what was going on.
+const ANSWER_SAVE: int = 0;
+const ANSWER_DONT_SAVE: int = 2;
+
+# ── state ──────────────────────────────────────────────────────────────────
+
+var g_todo: TodoList = TodoList();
+## The model index of each table row (the items the filter lets through).
+var g_rows: list[int] = [];
+var g_hide_completed: bool = false;
+## The file the list was opened from or saved to ("" while untitled).
+var g_path: string = "";
+## Whether the list changed since it was opened or saved.
+var g_dirty: bool = false;
+## The window's views: the one Ui, created in main once appInit has run (a
+## list, because a module variable needs its value before then). The handlers
+## are module functions, shared by the controls and the File menu, and read
+## it through `ui()`.
+var g_ui: list[Ui] = [];
+
+# ── the window ─────────────────────────────────────────────────────────────
+
+## Every view the handlers and the self-test touch.
+class Ui {
+    pub let win: Window;
+    pub let field: TextField;
+    pub let priority: PopUpButton;
+    pub let add: Button;
+    pub let table: TableView;
+    pub let hide: Checkbox;
+    pub let delete: Button;
+    pub let clear: Button;
+    pub let status: Label;
+
+    pub func constructor() {
+        let win = Window(APP_NAME, 520.0, 420.0);
+        win.setMinSize(420.0, 300.0);
+
+        # Only Return adds an item (`onReturn` in connect): leaving the field,
+        # e.g. by clicking the table, must not.
+        let field = TextField("");
+        field.setPlaceholder("New to-do");
+        let priority = PopUpButton(priorities());
+        priority.selectTitle(DEFAULT_PRIORITY);
+        priority.setToolTip("Priority of new items");
+        let add = Button("Add");
+        add.setEnabled(false);
+
+        let entry = HStack();
+        entry.setSpacing(8.0);
+        entry.setAlignment(ALIGN_CENTER);
+        entry.addExpanding(field);
+        entry.add(priority);
+        entry.add(add);
+
+        # Done is a fixed-width check-box column; Priority keeps its width
+        # unless the user drags it, so the title column takes the slack.
+        let table = TableView();
+        table.addCheckBoxColumn("done", "Done", 44.0);
+        table.addColumn("title", "Title", 300.0);
+        table.addColumn("priority", "Priority", 80.0);
+        table.setColumnResizing("priority", COLUMN_USER_RESIZES);
+        table.setColumnEditable("title", true);
+        table.setAlternatingRows(true);
+        table.setRowHeight(22.0);
+        setMinSize(table.scroll, 0.0, 120.0);
+
+        let hide = Checkbox("Hide completed");
+        let delete = Button("Delete");
+        delete.setEnabled(false);
+        let clear = Button("Clear Completed");
+        clear.setEnabled(false);
+        let actions = HStack();
+        actions.setSpacing(8.0);
+        actions.setAlignment(ALIGN_CENTER);
+        actions.add(hide);
+        actions.addSpacer();
+        actions.add(delete);
+        actions.add(clear);
+
+        let status = Label("");
+        status.setFont(12.0, false);
+        status.applyTextColor(systemColor(COLOR_SECONDARY_LABEL));
+
+        let root = VStack();
+        root.setInsets(16.0, 16.0, 14.0, 16.0);
+        root.setSpacing(10.0);
+        root.setAlignment(ALIGN_FILL);
+        root.add(entry);
+        root.addExpanding(table.scroll);
+        root.add(actions);
+        root.add(status);
+        win.setContent(root);
+        # The columns' widths are a start: fill the table's width (no empty
+        # header stub after Priority).
+        table.sizeColumnsToFit();
+
+        let file = Menu("File");
+        file.addItem("New", "n", func(): void { newDocument(); });
+        file.addItem("Open…", "o", func(): void { openDocument(); });
+        file.addSeparator();
+        file.addItem("Save", "s", func(): void { saveDocument(); });
+        file.addItem("Save As…", "S", func(): void { saveDocumentAs(); });
+        # Right after the app menu, where File goes (addMenu would append it
+        # after Window).
+        insertMenu(file, 1);
+
+        this.win = win;
+        this.field = field;
+        this.priority = priority;
+        this.add = add;
+        this.table = table;
+        this.hide = hide;
+        this.delete = delete;
+        this.clear = clear;
+        this.status = status;
+    }
+}
+
+func ui(): Ui {
+    let u = g_ui[0];
+    return u;
+}
+
+# ── showing the model ──────────────────────────────────────────────────────
+
+## Recompute the visible rows, reload the table and update the buttons, the
+## status line and the window title.
+func refresh(): void {
+    global g_rows;
+    let u = ui();
+    g_rows = g_todo.visibleIndexes(g_hide_completed);
+    u.table.reload();
+    u.status.setText(g_todo.status(g_hide_completed));
+    u.clear.setEnabled(g_todo.doneCount() > 0);
+    u.delete.setEnabled(u.table.selectedRow() >= 0);
+    updateTitle();
+    return;
+}
+
+## The last component of `path`.
+func baseName(path: string): string {
+    let parts = path.split("/");
+    let name = parts[parts.len() - 1];
+    return name;
+}
+
+## The file name shown in the title bar and in alerts.
+func documentName(): string {
+    if (g_path == "") {
+        return "Untitled";
+    }
+    let name = baseName(g_path);
+    return name;
+}
+
+## The title ("name — To-Do"), the file's icon in the title bar, and the
+## "edited" dot in the close button while there are unsaved changes.
+func updateTitle(): void {
+    let u = ui();
+    u.win.setTitle(documentName() + " — " + APP_NAME);
+    u.win.setRepresentedFilename(g_path);
+    u.win.setDocumentEdited(g_dirty);
+    return;
+}
+
+func markDirty(): void {
+    global g_dirty;
+    g_dirty = true;
+    return;
+}
+
+## The text of the table cell (`column`, `row`).
+func cellText(column: string, row: int): string {
+    if (row < 0 or row >= g_rows.len()) {
+        return "";
+    }
+    let item = g_todo.at(g_rows[row]);
+    if (column == "done") {
+        if (item.done) {
+            return "1";
+        }
+        return "0";
+    }
+    if (column == "title") {
+        return item.title;
+    }
+    return item.priority;
+}
+
+# ── handlers ───────────────────────────────────────────────────────────────
+
+## Add the field's text as a new item with the pop-up's priority (Add, or
+## Return in the field). A blank title just beeps.
+func addFromField(): void {
+    let u = ui();
+    var added = false;
+    safe {
+        added = g_todo.add(u.field.text(), u.priority.selectedTitle());
+    }
+    if (not added) {
+        beep();
+        return;
+    }
+    u.field.setText("");
+    updateAddButton();
+    # The new item goes to the end: a sort order shown in a header no longer
+    # holds.
+    u.table.setSortIndicator("", true);
+    markDirty();
+    refresh();
+    u.table.scrollToRow(u.table.rowCount() - 1);
+    u.field.focus();
+    return;
+}
+
+## A done box in the table was clicked.
+func setDone(row: int, done: bool): void {
+    if (row < 0 or row >= g_rows.len()) {
+        return;
+    }
+    safe {
+        g_todo.setDone(g_rows[row], done);
+    }
+    markDirty();
+    refresh();
+    return;
+}
+
+## A title cell was edited.
+func renameRow(row: int, text: string): void {
+    if (row < 0 or row >= g_rows.len()) {
+        return;
+    }
+    var changed = false;
+    safe {
+        changed = g_todo.rename(g_rows[row], text);
+    }
+    if (changed) {
+        markDirty();
+    } else {
+        # A blank title is refused; the cell shows the old one again.
+        beep();
+    }
+    refresh();
+    return;
+}
+
+## Delete the selected item, keeping the selection on the same row.
+func deleteSelected(): void {
+    let u = ui();
+    let row = u.table.selectedRow();
+    if (row < 0 or row >= g_rows.len()) {
+        return;
+    }
+    safe {
+        g_todo.remove(g_rows[row]);
+    }
+    markDirty();
+    u.table.deselectAll();
+    refresh();
+    var next = row;
+    if (next >= u.table.rowCount()) {
+        next = u.table.rowCount() - 1;
+    }
+    u.table.selectRow(next);
+    return;
+}
+
+func clearCompleted(): void {
+    var removed = 0;
+    safe {
+        removed = g_todo.clearCompleted();
+    }
+    if (removed > 0) {
+        markDirty();
+    }
+    ui().table.deselectAll();
+    refresh();
+    return;
+}
+
+func setHideCompleted(): void {
+    global g_hide_completed;
+    let u = ui();
+    g_hide_completed = u.hide.checked();
+    u.table.deselectAll();
+    refresh();
+    return;
+}
+
+## A header click sorts by that column (done, title or priority); a second
+## click on the same header reverses the order (the table keeps the
+## direction and the header's indicator). The sort reorders the list itself,
+## so Save keeps the order; it is an unsaved change only when the order
+## actually changed.
+func sortByColumn(column: string, ascending: bool): void {
+    var changed = false;
+    safe {
+        changed = g_todo.sortBy(column, ascending);
+    }
+    if (changed) {
+        markDirty();
+    }
+    ui().table.deselectAll();
+    refresh();
+    return;
+}
+
+# ── files ──────────────────────────────────────────────────────────────────
+
+## Before the list is replaced or the app quits: ask whether to save unsaved
+## changes. Returns true when it is fine to go on (saved, or the user chose
+## Don't Save). Cancel — and an alert that ended without a button press —
+## keeps everything.
+func confirmDiscard(): bool {
+    if (not g_dirty) {
+        return true;
+    }
+    let answer = alert("Do you want to save the changes to “" + documentName() + "”?",
+        "Your changes will be lost if you don't save them.", ["Save", "Cancel", "Don't Save"]);
+    if (answer == ANSWER_SAVE) {
+        let saved = saveDocument();
+        return saved;
+    }
+    if (answer == ANSWER_DONT_SAVE) {
+        return true;
+    }
+    # Cancel, or no answer.
+    return false;
+}
+
+## Replace the list (after New or Open) and show it.
+func showDocument(items: list[TodoItem], path: string): void {
+    global g_path;
+    global g_dirty;
+    safe {
+        g_todo.replaceAll(items);
+    }
+    g_path = path;
+    g_dirty = false;
+    let u = ui();
+    u.table.setSortIndicator("", true);
+    u.table.deselectAll();
+    refresh();
+    return;
+}
+
+func newDocument(): void {
+    if (not confirmDiscard()) {
+        return;
+    }
+    let empty: list[TodoItem] = [];
+    showDocument(empty, "");
+    return;
+}
+
+func openDocument(): void {
+    if (not confirmDiscard()) {
+        return;
+    }
+    let path = openFile([FILE_EXTENSION, "json"]);
+    if (path == "") {
+        return;
+    }
+    var items: list[TodoItem] = [];
+    try {
+        items = parseTodoFile(readText(path));
+    } catch (Exception as e) {
+        alert("“" + baseName(path) + "” could not be opened.", e.message, []);
+        return;
+    }
+    showDocument(items, path);
+    return;
+}
+
+## Save to the current file, asking for one while untitled. Returns whether
+## the list was saved.
+func saveDocument(): bool {
+    if (g_path == "") {
+        let saved = saveDocumentAs();
+        return saved;
+    }
+    let saved = writeDocument(g_path);
+    return saved;
+}
+
+## Ask for a file and save there. Returns whether the list was saved.
+func saveDocumentAs(): bool {
+    let path = saveFile(documentName() + "." + FILE_EXTENSION);
+    if (path == "") {
+        return false;
+    }
+    let saved = writeDocument(path);
+    return saved;
+}
+
+func writeDocument(path: string): bool {
+    global g_path;
+    global g_dirty;
+    try {
+        writeText(path, formatTodoFile(g_todo.items));
+    } catch (Exception as e) {
+        alert("“" + baseName(path) + "” could not be saved.", e.message, []);
+        return false;
+    }
+    g_path = path;
+    g_dirty = false;
+    updateTitle();
+    return true;
+}
+
+# ── closing and quitting with unsaved changes ──────────────────────────────
+
+## The close button, ⌘W or Window ▸ Close: whether the window may close.
+func windowShouldClose(): bool {
+    global g_dirty;
+    if (not confirmDiscard()) {
+        return false;
+    }
+    # The list is being thrown away: quitting (the last window closed) must
+    # not ask again.
+    g_dirty = false;
+    return true;
+}
+
+## ⌘Q, the app menu's Quit, or `quit()`: whether the app may quit.
+func appShouldQuit(): bool {
+    let ok = confirmDiscard();
+    return ok;
+}
+
+# ── wiring ─────────────────────────────────────────────────────────────────
+
+## Add is enabled while the field holds a title (on every keystroke).
+func updateAddButton(): void {
+    let u = ui();
+    u.add.setEnabled(u.field.text().trim() != "");
+    return;
+}
+
+func connect(u: Ui): void {
+    u.field.onReturn(func(): void { addFromField(); });
+    u.field.onChange(func(): void { updateAddButton(); });
+    u.add.onClick(func(): void { addFromField(); });
+    u.delete.onClick(func(): void { deleteSelected(); });
+    u.clear.onClick(func(): void { clearCompleted(); });
+    u.hide.onChange(func(): void { setHideCompleted(); });
+
+    u.table.setRowCount(func(): int {
+        let n = g_rows.len();
+        return n;
+    });
+    u.table.setCell(func(column: string, row: int): string {
+        let text = cellText(column, row);
+        return text;
+    });
+    u.table.onToggle(func(column: string, row: int, checked: bool): void { setDone(row, checked); });
+    # Only the title column is editable (the done boxes go to onToggle).
+    u.table.onEdit(func(column: string, row: int, text: string): void { renameRow(row, text); });
+    u.table.onSelect(func(row: int): void { u.delete.setEnabled(row >= 0); });
+    u.table.onSort(func(column: string, ascending: bool): void { sortByColumn(column, ascending); });
+    u.win.onShouldClose(func(): bool {
+        let ok = windowShouldClose();
+        return ok;
+    });
+    onShouldQuit(func(): bool {
+        let ok = appShouldQuit();
+        return ok;
+    });
+    return;
+}
+
+pub func main(): void {
+    appInit(APP_NAME);
+    let u = Ui();
+    g_ui.push(u);
+    connect(u);
+    refresh();
+    if (isSelfTest()) {
+        after(0.3, func(): void { selfTest(); });
+    }
+    run(u.win);
+}
+
+# ── self-test ──────────────────────────────────────────────────────────────
+
+## Where the self-test saves (relative to the working directory: the app's
+## folder when run by run_all.sh), so the dialog log stays the same anywhere.
+const SELF_TEST_DIR: string = ".temp";
+const SELF_TEST_FILE: string = ".temp/selftest.todo";
+const BROKEN_FILE: string = ".temp/broken.todo";
+
+## Print what the window shows: the status line, then one line per table row
+## read back from the table's cells (the check box's state for "done").
+func printTable(step: string): void {
+    let u = ui();
+    println("== " + step);
+    println("status: " + u.status.text());
+    var row = 0;
+    while (row < u.table.rowCount()) {
+        var mark = "[ ]";
+        if (u.table.isChecked("done", row)) {
+            mark = "[x]";
+        }
+        println("  " + mark + " " + u.table.cellText("title", row) + " | " + u.table.cellText("priority", row));
+        row = row + 1;
+    }
+    return;
+}
+
+func printButtons(): void {
+    let u = ui();
+    println("buttons: add=" + u.add.isEnabled().to_string() + " delete=" + u.delete.isEnabled().to_string()
+        + " clear=" + u.clear.isEnabled().to_string());
+    return;
+}
+
+## Whether the window shows unsaved changes (the dot in its close button).
+func printEdited(): void {
+    println("edited: " + ui().win.isDocumentEdited().to_string());
+    return;
+}
+
+## The title bar: the title and the name of the file whose icon it shows
+## (just the name, so the output is the same in any folder).
+func printTitle(): void {
+    let u = ui();
+    println("title: " + u.win.title());
+    var file = u.win.representedFilename();
+    if (file != "") {
+        file = baseName(file);
+    }
+    println("title-bar file: '" + file + "'");
+    return;
+}
+
+## Whether the window is still on screen.
+func printVisible(): void {
+    println("window visible: " + ui().win.isVisible().to_string());
+    return;
+}
+
+func printSort(column: string): void {
+    let u = ui();
+    println("sort indicator: " + u.table.sortIndicator(column));
+    return;
+}
+
+func printDialogs(): void {
+    for (line in testLog()) {
+        println("dialog: " + line);
+    }
+    return;
+}
+
+## Type `text` into the new-item field, as the keyboard would (replacing
+## what it holds).
+func typeItem(text: string): void {
+    ui().field.typeText(text);
+    return;
+}
+
+## Pick `title` in the priority pop-up as a user would.
+func pickPriority(title: string): void {
+    ui().priority.choose(priorityRank(title));
+    return;
+}
+
+## Choose the item `item` of the menu-bar menu `menu` ("File", "Window", or
+## the app menu "To-Do") as a click on it would.
+func chooseMenu(menu: string, item: string): void {
+    menuBarMenu(menu).itemWithTitle(item).perform();
+    return;
+}
+
+## The titles of the menu-bar menus, in order.
+func menuTitles(): string {
+    let bar = menuBar();
+    var titles: list[string] = [];
+    var i = 0;
+    while (i < bar.itemCount()) {
+        titles.push(bar.itemAt(i).title());
+        i = i + 1;
+    }
+    let joined = titles.join(", ");
+    return joined;
+}
+
+func selfTest(): void {
+    let u = ui();
+    println("menus: " + menuTitles());
+    printTable("start");
+    printButtons();
+
+    # Add items with the Add button and with Return (one with quotes in its
+    # title, which the file must escape).
+    typeItem("Buy milk");
+    pickPriority("High");
+    printButtons();
+    u.add.click();
+    typeItem("Water the plants");
+    pickPriority("Normal");
+    u.field.submit();
+    typeItem("Call \"Ada\" about the trip");
+    pickPriority("Low");
+    u.add.click();
+    typeItem("Renew passport");
+    pickPriority("High");
+    u.field.submit();
+    typeItem("Book the dentist");
+    pickPriority("Normal");
+    u.add.click();
+    typeItem("Pay the electricity bill");
+    u.field.submit();
+    println("field after adding: '" + u.field.text() + "'");
+    printTable("added six items");
+
+    # A blank title adds nothing (Return beeps); then the field is emptied.
+    typeItem("   ");
+    u.field.submit();
+    printTable("blank title refused");
+    typeItem("");
+
+    # Tick two boxes in the table.
+    u.table.clickCheckBox("done", 1);
+    u.table.clickCheckBox("done", 3);
+    printTable("ticked rows 1 and 3");
+    printButtons();
+
+    # Rename an item in place: edit the title cell and press Return.
+    u.table.commitEdit("title", 0, "Buy oat milk");
+    printTable("renamed row 0");
+
+    # Sort by priority with header clicks: ascending, a second click
+    # descending, a third ascending again (the sort is stable, so this is the
+    # first order once more).
+    u.table.clickHeader("priority");
+    printSort("priority");
+    printTable("sorted by priority");
+    u.table.clickHeader("priority");
+    printSort("priority");
+    printTable("sorted by priority, descending");
+    u.table.clickHeader("priority");
+    printSort("priority");
+    printTable("sorted by priority again");
+
+    # Filter.
+    u.hide.click();
+    printTable("hide completed");
+
+    # Click a row to select it, then click Delete.
+    u.table.clickRow(0);
+    printButtons();
+    u.delete.click();
+    printTable("deleted row 0 (filtered)");
+    println("selected after delete: " + u.table.selectedRow().to_string());
+
+    u.hide.click();
+    printTable("show completed");
+
+    # Save through the File menu (Save while untitled asks for a file).
+    createDir(SELF_TEST_DIR);
+    setTestAnswers([SELF_TEST_FILE]);
+    chooseMenu("File", "Save");
+    printDialogs();
+    printTitle();
+    printEdited();
+    println("file:");
+    for (line in readText(SELF_TEST_FILE).split("\n")) {
+        if (line != "") {
+            println("  " + line);
+        }
+    }
+
+    # Clear Completed changes the saved list, so New asks first: Don't Save.
+    u.clear.click();
+    printTable("cleared completed");
+    printTitle();
+    setTestAnswers(["2"]);
+    chooseMenu("File", "New");
+    printDialogs();
+    printTable("new (changes discarded)");
+    printTitle();
+
+    # Reopen the saved file.
+    setTestAnswers([SELF_TEST_FILE]);
+    chooseMenu("File", "Open…");
+    printDialogs();
+    printTable("reopened");
+    printTitle();
+    printEdited();
+
+    # It is in priority order already: sorting it again is no change.
+    u.table.clickHeader("priority");
+    printSort("priority");
+    printEdited();
+
+    # A file that is not a to-do list: an alert, and the list stays.
+    writeText(BROKEN_FILE, "{\"format\": \"loup-todo\", \"version\": 1, \"items\": [\n  {\"title\": \"x\"}\n]}\n");
+    setTestAnswers([BROKEN_FILE, "0"]);
+    chooseMenu("File", "Open…");
+    printDialogs();
+    printTable("open refused");
+    printTitle();
+
+    # An unsaved change; then New, closing the window (Window ▸ Close, ⌘W)
+    # and quitting all ask first, and Cancel keeps everything as it is. An
+    # alert that ends without a button press (-1) counts as Cancel too.
+    u.table.clickCheckBox("done", 0);
+    printTable("ticked row 0");
+    printEdited();
+    println("-- File > New");
+    setTestAnswers(["1"]);
+    chooseMenu("File", "New");
+    printDialogs();
+    println("-- File > New, the alert ends without a button press");
+    setTestAnswers(["-1"]);
+    chooseMenu("File", "New");
+    printDialogs();
+    println("-- Window > Close");
+    setTestAnswers(["1"]);
+    windowMenu().itemWithTitle("Close").perform();
+    printDialogs();
+    printVisible();
+    println("-- Command-W");
+    setTestAnswers(["1"]);
+    println("key taken: " + u.win.sendKey("w", MOD_COMMAND).to_string());
+    printDialogs();
+    printVisible();
+    println("-- " + APP_NAME + " > Quit");
+    setTestAnswers(["1"]);
+    appMenu().itemWithTitle("Quit " + APP_NAME).perform();
+    printDialogs();
+    printTable("new, close and quit cancelled");
+    printEdited();
+
+    let argv = runtime.args();
+    if (argv.len() > 1) {
+        u.win.snapshot(argv[1]);
+    }
+    # Quitting with unsaved changes asks too: Don't Save.
+    setTestAnswers(["2"]);
+    println("quit");
+    quit();
+    return;
+}

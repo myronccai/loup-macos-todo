@@ -1,0 +1,168 @@
+menus: To-Do, File, Edit, Window
+== start
+status: 0 items, 0 done
+buttons: add=false delete=false clear=false
+buttons: add=true delete=false clear=false
+field after adding: ''
+== added six items
+status: 6 items, 0 done
+  [ ] Buy milk | High
+  [ ] Water the plants | Normal
+  [ ] Call "Ada" about the trip | Low
+  [ ] Renew passport | High
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+== blank title refused
+status: 6 items, 0 done
+  [ ] Buy milk | High
+  [ ] Water the plants | Normal
+  [ ] Call "Ada" about the trip | Low
+  [ ] Renew passport | High
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+== ticked rows 1 and 3
+status: 6 items, 2 done
+  [ ] Buy milk | High
+  [x] Water the plants | Normal
+  [ ] Call "Ada" about the trip | Low
+  [x] Renew passport | High
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+buttons: add=false delete=false clear=true
+== renamed row 0
+status: 6 items, 2 done
+  [ ] Buy oat milk | High
+  [x] Water the plants | Normal
+  [ ] Call "Ada" about the trip | Low
+  [x] Renew passport | High
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+sort indicator: ascending
+== sorted by priority
+status: 6 items, 2 done
+  [ ] Buy oat milk | High
+  [x] Renew passport | High
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+sort indicator: descending
+== sorted by priority, descending
+status: 6 items, 2 done
+  [ ] Call "Ada" about the trip | Low
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Buy oat milk | High
+  [x] Renew passport | High
+sort indicator: ascending
+== sorted by priority again
+status: 6 items, 2 done
+  [ ] Buy oat milk | High
+  [x] Renew passport | High
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+== hide completed
+status: 6 items, 2 done (2 hidden)
+  [ ] Buy oat milk | High
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+buttons: add=false delete=true clear=true
+== deleted row 0 (filtered)
+status: 5 items, 2 done (2 hidden)
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+selected after delete: 0
+== show completed
+status: 5 items, 2 done
+  [x] Renew passport | High
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+dialog: saveFile: Untitled.todo -> .temp/selftest.todo
+title: selftest.todo — To-Do
+title-bar file: 'selftest.todo'
+edited: false
+file:
+  {
+    "format": "loup-todo",
+    "version": 1,
+    "items": [
+      {"title": "Renew passport", "done": true, "priority": "High"},
+      {"title": "Water the plants", "done": true, "priority": "Normal"},
+      {"title": "Book the dentist", "done": false, "priority": "Normal"},
+      {"title": "Pay the electricity bill", "done": false, "priority": "Normal"},
+      {"title": "Call \"Ada\" about the trip", "done": false, "priority": "Low"}
+    ]
+  }
+== cleared completed
+status: 3 items, 0 done
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+title: selftest.todo — To-Do
+title-bar file: 'selftest.todo'
+dialog: alert: Do you want to save the changes to “selftest.todo”? [Save, Cancel, Don't Save] -> 2
+== new (changes discarded)
+status: 0 items, 0 done
+title: Untitled — To-Do
+title-bar file: ''
+dialog: openFile: [todo, json] -> .temp/selftest.todo
+== reopened
+status: 5 items, 2 done
+  [x] Renew passport | High
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+title: selftest.todo — To-Do
+title-bar file: 'selftest.todo'
+edited: false
+sort indicator: ascending
+edited: false
+dialog: openFile: [todo, json] -> .temp/broken.todo
+dialog: alert: “broken.todo” could not be opened. [] -> 0
+== open refused
+status: 5 items, 2 done
+  [x] Renew passport | High
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+title: selftest.todo — To-Do
+title-bar file: 'selftest.todo'
+== ticked row 0
+status: 5 items, 1 done
+  [ ] Renew passport | High
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+edited: true
+-- File > New
+dialog: alert: Do you want to save the changes to “selftest.todo”? [Save, Cancel, Don't Save] -> 1
+-- File > New, the alert ends without a button press
+dialog: alert: Do you want to save the changes to “selftest.todo”? [Save, Cancel, Don't Save] -> -1
+-- Window > Close
+dialog: alert: Do you want to save the changes to “selftest.todo”? [Save, Cancel, Don't Save] -> 1
+window visible: true
+-- Command-W
+key taken: true
+dialog: alert: Do you want to save the changes to “selftest.todo”? [Save, Cancel, Don't Save] -> 1
+window visible: true
+-- To-Do > Quit
+dialog: alert: Do you want to save the changes to “selftest.todo”? [Save, Cancel, Don't Save] -> 1
+== new, close and quit cancelled
+status: 5 items, 1 done
+  [ ] Renew passport | High
+  [x] Water the plants | Normal
+  [ ] Book the dentist | Normal
+  [ ] Pay the electricity bill | Normal
+  [ ] Call "Ada" about the trip | Low
+edited: true
+quit

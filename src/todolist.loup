@@ -1,0 +1,279 @@
+@mode(host.dual)
+
+# todolist — the to-do list model: items with a title, a done flag and a
+# priority; adding, ticking off, renaming, deleting, clearing completed items,
+# sorting, the "hide completed" filter and the status line.
+#
+# No AppKit here: the window (main.lphc) maps its table rows to model indexes
+# through `visibleIndexes`, so everything the table shows is computed in this
+# module and tested by `todolist_test.lpscr` under `loup test`.
+
+## The priorities, from most to least urgent (the order of the pop-up and of
+## a sort by priority).
+pub func priorities(): list[string] {
+    let names = ["High", "Normal", "Low"];
+    return names;
+}
+
+## The priority new items get unless the user picks another.
+pub const DEFAULT_PRIORITY: string = "Normal";
+
+## The rank of `priority` in `priorities()` (0 = most urgent); throws
+## ValueError for a name that is not a priority.
+pub func priorityRank(priority: string): int {
+    let names = priorities();
+    var i = 0;
+    while (i < names.len()) {
+        if (names[i] == priority) {
+            return i;
+        }
+        i = i + 1;
+    }
+    let message = unknownPriority(priority);
+    throw ValueError(message);
+}
+
+## The message for a priority that is not one of `priorities()`.
+func unknownPriority(priority: string): string {
+    let names = priorities();
+    let message = "unknown priority '" + priority + "' (" + names.join(", ") + ")";
+    return message;
+}
+
+## Whether `priority` is one of `priorities()`.
+pub func isPriority(priority: string): bool {
+    let names = priorities();
+    let known = names.contains(priority);
+    return known;
+}
+
+## One to-do item. Items are immutable: a change replaces the item in its
+## list (so a TodoItem handed out earlier never changes under its holder).
+pub class TodoItem {
+    pub let title: string;
+    pub let done: bool;
+    pub let priority: string;
+
+    pub func constructor(title: string, done: bool, priority: string) {
+        this.title = title;
+        this.done = done;
+        this.priority = priority;
+    }
+}
+
+## What is wrong with an item titled `title` with `priority` ("" when
+## nothing): the title must not be blank and the priority must be known.
+pub func itemProblem(title: string, priority: string): string {
+    if (title.trim() == "") {
+        return "a to-do item needs a title";
+    }
+    if (not isPriority(priority)) {
+        let problem = unknownPriority(priority);
+        return problem;
+    }
+    return "";
+}
+
+## A new item (ValueError when `itemProblem` finds something wrong).
+pub func makeItem(title: string, done: bool, priority: string): TodoItem {
+    let problem = itemProblem(title, priority);
+    if (problem != "") {
+        throw ValueError(problem);
+    }
+    let item = TodoItem(title, done, priority);
+    return item;
+}
+
+## The ordered list of items. Indexes are positions in `items`; a filtered
+## view refers to items by these indexes (`visibleIndexes`). The methods that
+## change the list are `modifier`s: call them in a `safe { }` block (or a
+## `safe func`), which proves no other reference is changing it meanwhile.
+pub class TodoList {
+    pub var items: list[TodoItem];
+
+    pub func constructor() {
+        this.items = [];
+    }
+
+    pub func count(): int {
+        let n = this.items.len();
+        return n;
+    }
+
+    pub func doneCount(): int {
+        var n = 0;
+        for (item in this.items) {
+            if (item.done) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    ## The item at `index` (IndexError when out of range).
+    pub func at(index: int): TodoItem {
+        this.check(index);
+        let item = this.items[index];
+        return item;
+    }
+
+    ## Append an item titled `title` (surrounding blanks removed) with
+    ## `priority`, not done. Returns false and adds nothing when the title is
+    ## blank; throws ValueError for an unknown priority.
+    pub modifier func add(title: string, priority: string): bool {
+        let clean = title.trim();
+        if (clean == "") {
+            return false;
+        }
+        let item = makeItem(clean, false, priority);
+        this.items.push(item);
+        return true;
+    }
+
+    ## Mark the item at `index` done or not done.
+    pub modifier func setDone(index: int, done: bool): void {
+        this.check(index);
+        let item = this.items[index];
+        this.items[index] = TodoItem(item.title, done, item.priority);
+        return;
+    }
+
+    ## Give the item at `index` a new title. A blank title is refused (the
+    ## item keeps its title) and returns false.
+    pub modifier func rename(index: int, title: string): bool {
+        this.check(index);
+        let clean = title.trim();
+        if (clean == "") {
+            return false;
+        }
+        let item = this.items[index];
+        this.items[index] = TodoItem(clean, item.done, item.priority);
+        return true;
+    }
+
+    ## Remove the item at `index`.
+    pub modifier func remove(index: int): void {
+        this.check(index);
+        this.items.remove(index);
+        return;
+    }
+
+    ## Remove every done item; returns how many were removed.
+    pub modifier func clearCompleted(): int {
+        var kept: list[TodoItem] = [];
+        for (item in this.items) {
+            if (not item.done) {
+                kept.push(item);
+            }
+        }
+        let removed = this.items.len() - kept.len();
+        this.items = kept;
+        return removed;
+    }
+
+    ## Replace every item (after opening a file).
+    pub modifier func replaceAll(items: list[TodoItem]): void {
+        this.items = items;
+        return;
+    }
+
+    ## Sort by `key` — "title" (case-insensitive A→Z), "priority" (High
+    ## first) or "done" (open items first) — or, when not `ascending`, the
+    ## other way round (Z→A, Low first, done items first). The sort is
+    ## stable: items that compare equal keep their order either way. Returns
+    ## whether the order changed (sorting a sorted list changes nothing).
+    ## Throws ValueError for another key.
+    pub modifier func sortBy(key: string, ascending: bool): bool {
+        if (key != "title" and key != "priority" and key != "done") {
+            throw ValueError("cannot sort by '" + key + "' (title, priority, done)");
+        }
+        var direction = 1;
+        if (not ascending) {
+            direction = -1;
+        }
+        # An insertion sort, because it is stable (sorting by priority keeps
+        # the user's order inside each priority) and to-do lists are short;
+        # `list.sort` does not promise stability.
+        var sorted: list[TodoItem] = [];
+        var changed = false;
+        for (item in this.items) {
+            sorted.push(item);
+            var pos = sorted.len() - 1;
+            while (pos > 0 and compareItems(key, sorted[pos - 1], item) * direction > 0) {
+                sorted[pos] = sorted[pos - 1];
+                pos = pos - 1;
+                changed = true;
+            }
+            sorted[pos] = item;
+        }
+        this.items = sorted;
+        return changed;
+    }
+
+    ## The indexes of the items a table shows: all of them, or only the open
+    ## ones when `hideCompleted`.
+    pub func visibleIndexes(hideCompleted: bool): list[int] {
+        var shown: list[int] = [];
+        var i = 0;
+        while (i < this.items.len()) {
+            let item = this.items[i];
+            if (not (hideCompleted and item.done)) {
+                shown.push(i);
+            }
+            i = i + 1;
+        }
+        return shown;
+    }
+
+    ## The status line: "3 items, 1 done", plus "(1 hidden)" when the filter
+    ## hides some.
+    pub func status(hideCompleted: bool): string {
+        let n = this.count();
+        let done = this.doneCount();
+        var noun = "items";
+        if (n == 1) {
+            noun = "item";
+        }
+        var text = n.to_string() + " " + noun + ", " + done.to_string() + " done";
+        if (hideCompleted and done > 0) {
+            text = text + " (" + done.to_string() + " hidden)";
+        }
+        return text;
+    }
+
+    func check(index: int): void {
+        if (index < 0 or index >= this.items.len()) {
+            throw IndexError("no to-do item at index " + index.to_string()
+                + " (the list has " + this.items.len().to_string() + ")");
+        }
+        return;
+    }
+}
+
+## Compare two items by `key` for `TodoList.sortBy`: negative, 0 or positive.
+func compareItems(key: string, a: TodoItem, b: TodoItem): int {
+    if (key == "priority") {
+        let d = priorityRank(a.priority) - priorityRank(b.priority);
+        return d;
+    }
+    if (key == "done") {
+        let d = doneRank(a) - doneRank(b);
+        return d;
+    }
+    let x = a.title.toLowerCase();
+    let y = b.title.toLowerCase();
+    if (x < y) {
+        return -1;
+    }
+    if (x > y) {
+        return 1;
+    }
+    return 0;
+}
+
+func doneRank(item: TodoItem): int {
+    if (item.done) {
+        return 1;
+    }
+    return 0;
+}
